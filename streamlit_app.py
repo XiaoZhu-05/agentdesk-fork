@@ -13,6 +13,7 @@ from dataclasses import asdict, is_dataclass
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 def _load_secrets_into_env() -> None:
@@ -34,6 +35,32 @@ from app.graph.build_graph import run_query  # noqa: E402
 
 st.set_page_config(page_title="AgentDesk · Agentic RAG 控制台",
                    page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
+
+# 强制侧边栏展开：Streamlit 会把折叠状态记在浏览器里，导致部分用户看不到侧边栏。
+# 加载后若检测到侧边栏处于折叠（宽度≈0），自动点击展开按钮。
+components.html(
+    """
+    <script>
+    (function () {
+      var tries = 0;
+      var timer = setInterval(function () {
+        var sb = parent.document.querySelector('section[data-testid="stSidebar"]');
+        var btn = parent.document.querySelector('[data-testid="stSidebarCollapseButton"] button');
+        if (!sb || !btn) {
+          if (++tries > 40) { clearInterval(timer); }
+          return;
+        }
+        if (sb.getBoundingClientRect().width < 50) {
+          btn.click();
+        } else {
+          clearInterval(timer);
+        }
+      }, 400);
+    })();
+    </script>
+    """,
+    height=0,
+)
 
 # ============================ Design System (CSS) ============================
 st.markdown(
@@ -160,6 +187,7 @@ st.markdown(
       /* —— Streamlit 控件覆写 —— */
       section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0b0f1e,#0a0e1a);
         border-right:1px solid var(--stroke);}
+      section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"]{display:none !important;}
       section[data-testid="stSidebar"] .block-container{padding-top:1.4rem;}
       .stTextInput input{background:var(--surface-2)!important; color:var(--ink)!important;
         border:1px solid var(--stroke-2)!important; border-radius:14px!important; height:52px; font-size:.95rem;
@@ -192,8 +220,18 @@ _META_PATH = os.path.join(os.path.dirname(INDEX_PATH), "index_meta.json")
 
 def _emb_signature() -> dict:
     # 索引指纹：embedding 维度由「是否真实模型 + 模型名」决定，变了就必须重建
+    # 同时记录 data/docs 下的文件清单（名称+大小+修改时间），新增/修改文档也会触发重建
+    files = []
+    try:
+        for name in sorted(os.listdir(os.path.join("data", "docs"))):
+            p = os.path.join("data", "docs", name)
+            if os.path.isfile(p):
+                files.append((name, os.path.getsize(p), int(os.path.getmtime(p))))
+    except Exception:
+        pass
     return {"use_llm": bool(settings.use_llm),
-            "model": settings.embedding_model if settings.use_llm else "offline-hash"}
+            "model": settings.embedding_model if settings.use_llm else "offline-hash",
+            "files": files}
 
 
 def _read_meta():
@@ -251,6 +289,10 @@ def ensure_index() -> int:
 
 
 n_chunks = ensure_index()
+
+_toast_msg = st.session_state.pop("_toast", None)
+if _toast_msg:
+    st.toast(_toast_msg)
 
 NODE_LABELS = {
     "memory_retrieve": ("Memory · Retrieve", "加载短期上下文 + 召回长期记忆"),
@@ -326,6 +368,39 @@ with st.sidebar:
         if st.button("新会话", use_container_width=True, key="new_sess"):
             st.session_state["mem_sid"] = _uuid.uuid4().hex
             st.rerun()
+
+    st.markdown("<div class='eyebrow' style='margin-top:18px'>知识库 · 上传文档</div>",
+                unsafe_allow_html=True)
+    # 上传成功后更换控件 key，强制 Streamlit 重建空控件（仅删 session 键无法清掉浏览器端已选文件）
+    _up_key = f"kb_uploader_{st.session_state.get('_up_key', 0)}"
+    _up = st.file_uploader(
+        "上传文档（txt / md / pdf / docx / xlsx / csv / pptx / html / json / rtf / xml / xls / odt / epub）",
+        type=["txt", "md", "pdf", "docx", "xlsx", "csv", "pptx",
+              "html", "json", "rtf", "xml", "xls", "odt", "epub"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key=_up_key,
+    )
+    if _up:
+        saved = []
+        for _f in _up:
+            _name = os.path.basename(_f.name)
+            _dest = os.path.join("data", "docs", _name)
+            try:
+                with open(_dest, "wb") as _fh:
+                    _fh.write(_f.getbuffer())
+                saved.append(_name)
+            except Exception as _e:
+                st.error(f"保存 {_name} 失败：{_e}")
+        if saved:
+            ensure_index.clear()
+            st.session_state["_up_key"] = st.session_state.get("_up_key", 0) + 1
+            st.rerun()
+    if st.button("重建索引", use_container_width=True, key="rebuild_idx"):
+        ensure_index.clear()
+        _rebuild_index()
+        st.session_state["_toast"] = "索引重建完成"
+        st.rerun()
 
     st.markdown("<div class='eyebrow' style='margin-top:18px'>试一试</div>", unsafe_allow_html=True)
     for q in SAMPLES:
@@ -416,13 +491,29 @@ c_in, c_btn = st.columns([4, 1])
 with c_in:
     # 用 key 绑定 session_state['qbox']；示例/侧边栏按钮已在上方写好它，
     # 故无需 value=（value= 在按钮场景下常不回显，正是“点了没反应”的根因）。
+    def _on_query_enter() -> None:
+        # 文本输入按回车才会提交值；提交时顺便标记自动运行，
+        # 这样“输入 → 回车”即可直接出答案，无需再点运行。
+        st.session_state["_autorun"] = True
+
+    # 查询成功后在下一轮把输入框清空（必须在控件实例化之前设置，否则 Streamlit 报错）
+    if st.session_state.pop("_clear_qbox", False):
+        st.session_state["qbox"] = ""
+
     query = st.text_input("向知识库提问", key="qbox", label_visibility="collapsed",
-                          placeholder="例如：公司A和公司B 2025年营收分别是多少？")
+                          placeholder="例如：公司A和公司B 2025年营收分别是多少？",
+                          on_change=_on_query_enter)
+    st.markdown(
+        "<div style='color:var(--faint);font-size:.72rem;margin-top:4px'>"
+        "输入后按 Enter 直接运行；或先按 Enter 提交，再点 ⚡ 运行。</div>",
+        unsafe_allow_html=True,
+    )
 with c_btn:
     go = st.button("⚡ 运行", type="primary", use_container_width=True)
 
 _autorun = st.session_state.pop("_autorun", False)
 # ============================ 运行与渲染 ============================
+_last = None
 if (go or _autorun) and query.strip():
     try:
         with st.spinner("Agent 编排执行中：记忆召回 → 改写 → 检索 → 工具 → 生成 → 反思 → 记忆写入…"):
@@ -436,15 +527,36 @@ if (go or _autorun) and query.strip():
                  "可在上方换一个更稳的模型重试。")
         st.stop()
 
-    answer = state.get("answer", "")
-    verify = state.get("verify", {}) or {}
-    iterations = state.get("iterations", 0)
-    evidence = state.get("evidence", []) or []
-    tool_results = state.get("tool_results", []) or []
-    trace = state.get("trace", []) or []
-    cites = state.get("citations", []) or []
-    recalled = state.get("recalled_memories", []) or []
-    mem_writes = state.get("memory_writes", []) or []
+    # 把本次结果存入 session_state：上传/重建索引等 rerun 后仍能继续展示答案与分析
+    _last = {
+        "answer": state.get("answer", ""),
+        "verify": state.get("verify", {}) or {},
+        "iterations": state.get("iterations", 0),
+        "evidence": state.get("evidence", []) or [],
+        "tool_results": state.get("tool_results", []) or [],
+        "trace": state.get("trace", []) or [],
+        "citations": state.get("citations", []) or [],
+        "recalled_memories": state.get("recalled_memories", []) or [],
+        "memory_writes": state.get("memory_writes", []) or [],
+        "working_memory": state.get("working_memory"),
+    }
+    st.session_state["last_state"] = _last
+    st.session_state["_clear_qbox"] = True
+    st.rerun()
+else:
+    _last = st.session_state.get("last_state")
+
+if _last is not None:
+    answer = _last.get("answer", "")
+    verify = _last.get("verify", {}) or {}
+    iterations = _last.get("iterations", 0)
+    evidence = _last.get("evidence", []) or []
+    tool_results = _last.get("tool_results", []) or []
+    trace = _last.get("trace", []) or []
+    cites = _last.get("citations", []) or []
+    recalled = _last.get("recalled_memories", []) or []
+    mem_writes = _last.get("memory_writes", []) or []
+    wm = _last.get("working_memory") or {}
 
     score = float(verify.get("score", 0) or 0)
     faithful = bool(verify.get("faithful"))
@@ -467,7 +579,7 @@ if (go or _autorun) and query.strip():
         )
 
     # —— 对话历史（短期记忆 buffer，体现多轮）——
-    _wm = state.get("working_memory") or {}
+    _wm = wm or {}
     _msgs = _wm.get("messages", []) or []
     _summary = _wm.get("running_summary", "")
     if _msgs or _summary:
@@ -678,11 +790,12 @@ if (go or _autorun) and query.strip():
                      "memory_writes": mem_writes, "trace": trace})
 
 else:
+    _hint = ("已接入真实大模型 · 点上方示例问题，或直接提问。" if settings.use_llm
+             else "离线 fallback：无需 API key 也能体验完整链路。")
     st.markdown(
-        "<div class='card' style='text-align:center;padding:40px 24px;border-style:dashed'>"
-        "<div style='font-size:2rem'>🧠</div>"
-        "<div style='font-weight:700;font-size:1.05rem;margin-top:8px'>输入问题，开始一次 Agent 编排</div>"
-        "<div style='color:var(--muted);font-size:.86rem;margin-top:6px'>"
-        "点上方示例问题，或直接提问 — 无需 API key 也能体验完整链路（离线 fallback）。</div></div>",
+        f"<div class='card' style='text-align:center;padding:40px 24px;border-style:dashed'>"
+        f"<div style='font-size:2rem'>🧠</div>"
+        f"<div style='font-weight:700;font-size:1.05rem;margin-top:8px'>输入问题，开始一次 Agent 编排</div>"
+        f"<div style='color:var(--muted);font-size:.86rem;margin-top:6px'>{_hint}</div></div>",
         unsafe_allow_html=True,
     )

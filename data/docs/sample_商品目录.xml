@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<productCatalog>
+  <category name="云服务">
+    <product id="P1001">
+      <name>对象存储标准版</name>
+      <price currency="CNY">0.12 元/GB/月</price>
+      <sla>99.95%</sla>
+      <stock>充足</stock>
+    </product>
+    <product id="P1002">
+      <name>弹性计算-高性能型</name>
+      <price currency="CNY">0.88 元/小时</price>
+      <sla>99.9%</sla>
+      <stock>华东区售罄</stock>
+    </product>
+  </category>
+  <category name="AI 服务">
+    <product id="P2001">
+      <name>知识库问答 API</name>
+      <price currency="CNY">0.02 元/次</price>
+      <sla>99.95%</sla>
+      <stock>充足</stock>
+    </product>
+  </category>
+</productCatalog>

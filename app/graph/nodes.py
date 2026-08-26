@@ -1,27 +1,32 @@
 """Agent 节点：memory_retrieve → planner → retrieval → tool → writer → critic
 （带重试循环）→ memory_write →(summarize?)。"""
+
+# 1. 导入依赖
 from __future__ import annotations
 
 import re
 
-from app.config import settings
-from app.graph.state import AgentState
+from app.config import settings               # 全局配置，例如 top_k、max_iterations
+from app.graph.state import AgentState        # LangGraph 的全局共享状态
 from app.llm import chat
-from app.rag.query_rewrite import rewrite
-from app.graph.judge import judge
-from app.rag.retriever import Retriever
+from app.rag.query_rewrite import rewrite     # 把原始问题改写成多个检索 query
+from app.graph.judge import judge             # 对答案进行验证
+from app.rag.retriever import Retriever       # RAG 检索器
 from app.tools.dispatch import call as call_tool
 
-_retriever = None
+
+# 2. 全局缓存对象
+_retriever = None   # 延迟初始化,只有真正需要 Retriever 时才创建
 _short_mem = None
-_long_mem = None
-_ARITH = re.compile(r"^[\d\s\.\+\-\*\/\(\)%]+$")
+_long_mem = None 
+_ARITH = re.compile(r"^[\d\s\.\+\-\*\/\(\)%]+$")   # 允许的字符,后面的 tool_node 会用它判断是否调用 calculator
 
 
+# 3. 延迟初始化辅助函数
 def _get_retriever() -> Retriever:
     global _retriever
     if _retriever is None:
-        _retriever = Retriever()
+        _retriever = Retriever()   # 对 Retriever 这个类进行实例化
     return _retriever
 
 
@@ -44,6 +49,8 @@ def _get_long_mem():
 _CITE = re.compile(r"\[([^\[\]\n]{1,60})\]")
 
 
+# 4. 引用清洗（属于 LLM 输出后处理）
+# 检查并清理答案里的引用标记 [xxx]，只保留真实有效的引用，删除模板占位符和疑似模型编造的引用。
 def _sanitize_citations(answer: str, valid_ids: list[str]) -> str:
     """剔除答案里无效的字面占位/幻觉引用（如 [chunk_id]），保留真实引用与 [tool:*] 溯源。
 
@@ -51,11 +58,12 @@ def _sanitize_citations(answer: str, valid_ids: list[str]) -> str:
     规则：括号内是真实 chunk_id 或 tool: 溯源 → 保留；含空格更像正文 → 不动；其余视为
     无效引用剔除。最后清理多余空格与悬挂标点。
     """
-    valid = set(valid_ids)
+    valid = set(valid_ids)   # 变集合
+    # 用于处理小模型经常照抄 Prompt 的问题
     placeholders = {"chunk_id", "chunk_ids", "chunkid", "id", "ids", "doc_id",
                     "ref", "citation", "source", "来源", "引用"}
 
-    def _repl(m: "re.Match") -> str:
+    def _repl(m: "re.Match") -> str:   # 负责判断每一个：[xxx]应该保留还是删除。
         inner = m.group(1).strip()
         if inner in valid or inner.startswith("tool:"):
             return m.group(0)                       # 真实引用 / 工具溯源 → 保留
@@ -66,28 +74,39 @@ def _sanitize_citations(answer: str, valid_ids: list[str]) -> str:
         if re.fullmatch(r"[A-Za-z0-9]+([._#\-][A-Za-z0-9]+)+", inner):
             return ""
         return m.group(0)
-
+    # 最后的文本清洗
     cleaned = _CITE.sub(_repl, answer)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"[ \t]+([，。、；：！？％%])", r"\1", cleaned)
     return cleaned.strip()
 
 
+# 5.1 记忆节点(读取短期记忆+召回长期记忆)
 def memory_retrieve_node(state: AgentState) -> AgentState:
     """入口节点：加载短期工作记忆 + 召回长期记忆。记忆故障不阻断主流程。"""
-    if not getattr(settings, "mem_enabled", True):
+    # 对记忆设置为false时，这里直接reutrn；对记忆设置为true时，不符合if条件；对记忆设置为空时，经过getattr函数，记忆设置为true时，不符合if条件
+    # settings 中没有 mem_enabled → mem_enabled = True → 开启记忆，不符合if条件
+    # settings 中有 mem_enabled 且 mem_enabled = False → 直接 return   
+    if not getattr(settings, "mem_enabled", True):   # settings中读取属性mem_enabled，如果这个值是假值，就 return {}
+    # getattr() 是 Python 的一个内置函数:从一个对象中读取某个属性；如果属性不存在，还可以给一个默认值。
+    # getattr(settings, "mem_enabled", True):settings中读取属性mem_enabled, 不存在就返回 True；只有
+    
         return {}
-    user_id = state.get("user_id", "anonymous")
-    session_id = state.get("session_id", "")
+    user_id = state.get("user_id", "anonymous")  # → 长期记忆
+    session_id = state.get("session_id", "")     #  → 短期记忆
     out: AgentState = {}
+
+    # 短期记忆
     has_short = False
     if session_id:
         try:
-            wm = _get_short_mem().load(session_id)
-            out["working_memory"] = wm.to_dict()
+            wm = _get_short_mem().load(session_id)   # 读取 wm 是 WorkingMemory 的实例
+            out["working_memory"] = wm.to_dict()     # `wm.to_dict()`对象转字典，放到`out["working_memory"]`，返回给 state
             has_short = bool(wm.messages or wm.running_summary)
         except Exception:
             pass
+
+    # 长期记忆
     recalled = []
     try:
         recs = _get_long_mem().retrieve(
@@ -104,13 +123,16 @@ def memory_retrieve_node(state: AgentState) -> AgentState:
     return out
 
 
+# 5.2 规划节点
 def planner_node(state: AgentState) -> AgentState:
     query = state["query"]
     queries = rewrite(query)
     trace = state.get("trace", []) + [{"node": "planner", "queries": queries}]
     return {"plan": " | ".join(queries), "queries": queries, "trace": trace}
+    # `"plan": " | ".join(queries)`:把多个查询用 `|` 竖线拼接成一个字符串，方便看完整计划。
 
 
+# 5.3 检索节点
 def retrieval_node(state: AgentState) -> AgentState:
     queries = state.get("queries") or [state["query"]]
     evidence = _get_retriever().retrieve_multi(
@@ -124,25 +146,35 @@ def retrieval_node(state: AgentState) -> AgentState:
     return {"evidence": evidence, "iterations": iterations, "trace": trace}
 
 
+# 5.4 工具节点
 def tool_node(state: AgentState) -> AgentState:
     """轻量工具路由：可解析的算术表达式 -> calculator；问库统计 -> kb_stats。"""
     query = state["query"]
     results = []
+    # 预处理
     expr = query.strip().rstrip("?？=").strip()
+    # - `.strip()`：去掉首尾空格换行。
+    # - `.rstrip("?？=")`：把字符串末尾的中文问号、英文问号、等号删掉。
+
+    # 判断是否是算术计算，调用 calculator 计算器工具
     if _ARITH.match(expr) and any(c in expr for c in "+-*/%"):
         results.append({"tool": "calculator",
                         "out": call_tool("calculator", {"expression": expr})})
+    # elif 判断是否询问知识库统计信息，调用 kb_stats
     elif any(k in query for k in ["多少篇", "多少个文档", "知识库", "文档数量"]):
         results.append({"tool": "kb_stats", "out": call_tool("kb_stats", {})})
+    # 记录执行轨迹 trace
     trace = state.get("trace", []) + [{"node": "tool", "called": [r["tool"] for r in results]}]
     return {"tool_results": results, "trace": trace}
 
 
+# 5.5 答案生成节点
 def writer_node(state: AgentState) -> AgentState:
     evidence = state.get("evidence", [])
     context = "\n\n".join(f"[{e.chunk_id}] {e.text}" for e in evidence)
     tool_ctx = ""
     for r in state.get("tool_results", []):
+        # **只有工具调用成功（ok=True），才把工具结果拼到 prompt 上下文`tool_ctx`里**。
         if r["out"].get("ok"):
             tool_ctx += f"\n[tool:{r['tool']}] {r['out']['result']}"
     mem_lines = [f"- ({m['kind']}) {m['text']}" for m in state.get("recalled_memories", [])]
@@ -173,6 +205,7 @@ def writer_node(state: AgentState) -> AgentState:
     return {"answer": answer, "citations": citations, "trace": trace}
 
 
+# 5.6 验证节点
 def critic_node(state: AgentState) -> AgentState:
     verify = judge(state["query"], state.get("answer", ""), state.get("evidence", []),
                    state.get("tool_results", []))
@@ -180,6 +213,7 @@ def critic_node(state: AgentState) -> AgentState:
     return {"verify": verify, "trace": trace}
 
 
+# 5.7 重试条件
 def should_retry(state: AgentState) -> str:
     """条件边：不忠实且未超 max_iterations -> 重试检索；否则结束。"""
     verify = state.get("verify", {})
@@ -190,6 +224,7 @@ def should_retry(state: AgentState) -> str:
     return "retry"
 
 
+# 5.8 长期/短期记忆写入节点
 def memory_write_node(state: AgentState) -> AgentState:
     """出口节点：抽取并写入长期记忆（经演化），同时把本轮追加到短期记忆。"""
     if not getattr(settings, "mem_enabled", True):
@@ -198,6 +233,8 @@ def memory_write_node(state: AgentState) -> AgentState:
     session_id = state.get("session_id", "")
     out: AgentState = {}
     writes = []
+
+    # 长期记忆
     try:
         lm = _get_long_mem()
         items = lm.extract(state.get("query", ""), state.get("answer", ""))
@@ -206,6 +243,8 @@ def memory_write_node(state: AgentState) -> AgentState:
     except Exception:
         writes = []
     out["memory_writes"] = writes
+
+    # 短期记忆
     if session_id:
         try:
             from app.memory.schema import WorkingMemory
@@ -223,6 +262,23 @@ def memory_write_node(state: AgentState) -> AgentState:
     return out
 
 
+# 5.9 摘要
+def need_summarize_edge(state: AgentState) -> str:
+    """条件边：短期记忆需要摘要 -> summarize；否则 end。"""
+    if not getattr(settings, "mem_enabled", True) or not state.get("session_id"):
+        return "end"
+    wm_dict = state.get("working_memory")
+    if not wm_dict:
+        return "end"
+    try:
+        from app.memory.schema import WorkingMemory
+        return "summarize" if _get_short_mem().need_summarize(
+            WorkingMemory.from_dict(wm_dict)) else "end"
+    except Exception:
+        return "end"
+
+    
+# 5.10 摘要节点
 def summarize_node(state: AgentState) -> AgentState:
     """短期 buffer 超阈值时压缩旧轮次为滚动 summary。"""
     if not getattr(settings, "mem_enabled", True):
@@ -247,16 +303,11 @@ def summarize_node(state: AgentState) -> AgentState:
         return {}
 
 
-def need_summarize_edge(state: AgentState) -> str:
-    """条件边：短期记忆需要摘要 -> summarize；否则 end。"""
-    if not getattr(settings, "mem_enabled", True) or not state.get("session_id"):
-        return "end"
-    wm_dict = state.get("working_memory")
-    if not wm_dict:
-        return "end"
-    try:
-        from app.memory.schema import WorkingMemory
-        return "summarize" if _get_short_mem().need_summarize(
-            WorkingMemory.from_dict(wm_dict)) else "end"
-    except Exception:
-        return "end"
+
+
+
+# state["query"]:字典直接取值，key 不存在直接抛KeyError异常，程序报错。
+
+# state.get("query"):key 不存在返回None，不会抛异常。
+# 可给默认值：`state.get("query", "")`，取不到返回空字符串。
+

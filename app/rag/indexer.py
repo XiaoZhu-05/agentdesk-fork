@@ -8,6 +8,7 @@ from app.config import settings
 from app.llm import embed_texts
 from app.rag.store import Chunk
 from app.rag.store_factory import get_store
+from app.rag.extractors import extract_text, SUPPORTED_EXTS
 
 INDEX_PATH = "data/index/store.json"
 
@@ -32,11 +33,18 @@ def build_index(docs_dir: str = "data/docs"):
     store = get_store()
     all_chunks: List[Chunk] = []
     for fname in sorted(os.listdir(docs_dir)):
-        if not fname.lower().endswith((".txt", ".md")):
-            continue
         path = os.path.join(docs_dir, fname)
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
+        if not os.path.isfile(path):
+            continue
+        if os.path.splitext(fname)[1].lower() not in SUPPORTED_EXTS:
+            continue
+        try:
+            content = extract_text(path)
+        except Exception as e:  # 单个文件解析失败不阻断整体建索引
+            print(f"[indexer] skip {fname}: {e}")
+            continue
+        if not content.strip():
+            continue
         pieces = split_text(content, settings.chunk_size, settings.chunk_overlap)
         for i, piece in enumerate(pieces):
             all_chunks.append(Chunk(doc_id=fname, chunk_id=f"{fname}#{i}", text=piece, embedding=[]))

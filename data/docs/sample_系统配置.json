@@ -1,0 +1,29 @@
+{
+  "service": "agentdesk-api",
+  "version": "2.1.0",
+  "port": 8000,
+  "database": {
+    "type": "postgres",
+    "host": "10.20.30.40",
+    "max_connections": 100
+  },
+  "rag": {
+    "top_k": 5,
+    "rerank": true,
+    "embedding_model": "text-embedding-v3"
+  },
+  "rate_limit": {
+    "qps": 50,
+    "burst": 100
+  },
+  "feature_flags": {
+    "multimodal": true,
+    "mcp_market": false,
+    "gray_ratio": 0.2
+  },
+  "owner": {
+    "team": "AI 平台组",
+    "oncall": "张三",
+    "email": "ai@example.com"
+  }
+}

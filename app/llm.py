@@ -13,6 +13,7 @@ import numpy as np
 from app.config import settings
 
 EMBED_DIM = 256
+EMBED_BATCH_SIZE = 10  # 百炼 text-embedding-v3 兼容接口单次上限 10 条；OpenAI 原接口更宽松，10 条通用安全
 
 
 def _tokens(text: str) -> List[str]:
@@ -41,8 +42,12 @@ def _embed_raw(texts: List[str]) -> List[List[float]]:
 
     client = OpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url,
                     timeout=30.0, max_retries=1)  # 防接口挂起导致前端无限转圈
-    resp = client.embeddings.create(model=settings.embedding_model, input=texts)
-    return [d.embedding for d in resp.data]
+    out: List[List[float]] = []
+    for i in range(0, len(texts), EMBED_BATCH_SIZE):
+        batch = texts[i : i + EMBED_BATCH_SIZE]
+        resp = client.embeddings.create(model=settings.embedding_model, input=batch)
+        out.extend(d.embedding for d in resp.data)  # 按批顺序拼接，保持与输入一致
+    return out
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
