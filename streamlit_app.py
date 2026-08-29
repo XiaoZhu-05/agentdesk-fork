@@ -7,10 +7,18 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import os
+import time
 from dataclasses import asdict, is_dataclass
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -18,7 +26,7 @@ import streamlit.components.v1 as components
 
 def _load_secrets_into_env() -> None:
     keys = ["OPENAI_API_KEY", "OPENAI_BASE_URL", "CHAT_MODEL", "EMBEDDING_MODEL",
-            "TOP_K", "MAX_ITERATIONS"]
+            "TOP_K", "MAX_ITERATIONS", "DELETE_PASSWORD"]
     for k in keys:
         try:
             if k in st.secrets and str(st.secrets[k]).strip():
@@ -38,24 +46,183 @@ st.set_page_config(page_title="AgentDesk · Agentic RAG 控制台",
 
 # 强制侧边栏展开：Streamlit 会把折叠状态记在浏览器里，导致部分用户看不到侧边栏。
 # 加载后若检测到侧边栏处于折叠（宽度≈0），自动点击展开按钮。
+# ============================ 访问控制（登录 + 额度） ============================
+_DEMO_PASSWORD_HASH = os.environ.get("DEMO_PASSWORD", "")
+_DEMO_SESSION_QUOTA = int(os.environ.get("DEMO_SESSION_QUOTA", "30"))
+_DEMO_DAILY_QUOTA = int(os.environ.get("DEMO_DAILY_QUOTA", "100"))
+_DEMO_GUEST_UPLOADS = int(os.environ.get("DEMO_GUEST_UPLOADS", "3"))
+_DEMO_GUEST_QUERIES = int(os.environ.get("DEMO_GUEST_QUERIES", "10"))
+
+if not _DEMO_PASSWORD_HASH:
+    st.error("演示站未配置访问密码（缺少 DEMO_PASSWORD 环境变量），请联系管理员。")
+    st.stop()
+
+if not st.session_state.get("_authed"):
+    st.markdown(
+        "<div style='max-width:420px;margin:12vh auto;text-align:center'>"
+        "<div style='font-size:1.4rem;font-weight:800;margin-bottom:8px'>AgentDesk · 演示控制台</div>"
+        "<div style='color:#94a3b8;font-size:.85rem;margin-bottom:24px'>请输入访问密码后查看演示</div></div>",
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form"):
+        _pw = st.text_input("访问密码", type="password", placeholder="请输入访问密码")
+        _sub = st.form_submit_button("登录", type="primary", use_container_width=True)
+    if _sub:
+        if hashlib.sha256(_pw.encode("utf-8")).hexdigest() == _DEMO_PASSWORD_HASH:
+            st.session_state["_authed"] = True
+            st.session_state["_mode"] = "member"
+            st.session_state["_visitor_id"] = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+            st.rerun()
+        else:
+            st.error("密码错误，请重试。")
+    st.markdown("<div style='text-align:center;color:#64748b;font-size:.8rem;margin:12px 0 8px'>— 或 —</div>", unsafe_allow_html=True)
+    _gc1, _gc2 = st.columns([3, 4])
+    with _gc1:
+        if st.button("访客模式进入", use_container_width=True):
+            st.session_state["_authed"] = True
+            st.session_state["_mode"] = "guest"
+            st.session_state["_visitor_id"] = hashlib.sha256(os.urandom(16)).hexdigest()[:16]
+            st.rerun()
+    with _gc2:
+        st.markdown(
+            f"<div style='color:#94a3b8;font-size:.78rem;padding-top:8px'>访客无需密码 · 上传知识库 {_DEMO_GUEST_UPLOADS} 次 · 提问 {_DEMO_GUEST_QUERIES} 次</div>",
+            unsafe_allow_html=True,
+        )
+    st.stop()
+
+try:
+    import redis as _redis_mod
+except Exception:
+    _redis_mod = None
+
+
+def _quota_redis():
+    if _redis_mod is None:
+        return None
+    _url = os.environ.get("REDIS_URL") or getattr(settings, "redis_url", "") or ""
+    if not _url:
+        return None
+    try:
+        return _redis_mod.Redis.from_url(_url, decode_responses=True, socket_timeout=2)
+    except Exception:
+        return None
+
+
+def _quota_usage():
+    """返回 (本会话剩余, 今日全站剩余)；Redis 不可用时返回 (None, None) 表示不限额。"""
+    _r = _quota_redis()
+    if _r is None:
+        return (None, None)
+    _vid = st.session_state.get("_visitor_id") or "anon"
+    _day = time.strftime("%Y-%m-%d")
+    try:
+        _s = int(_r.get(f"demoq:s:{_vid}") or 0)
+        _d = int(_r.get(f"demoq:d:{_day}") or 0)
+        return (max(_DEMO_SESSION_QUOTA - _s, 0), max(_DEMO_DAILY_QUOTA - _d, 0))
+    except Exception:
+        return (None, None)
+
+
+def _quota_consume() -> bool:
+    """真实调用成功后扣减额度。"""
+    _r = _quota_redis()
+    if _r is None:
+        return True
+    _vid = st.session_state.get("_visitor_id") or "anon"
+    _day = time.strftime("%Y-%m-%d")
+    try:
+        _s = _r.incr(f"demoq:s:{_vid}")
+        _d = _r.incr(f"demoq:d:{_day}")
+        _r.expire(f"demoq:s:{_vid}", 7 * 86400)
+        _r.expire(f"demoq:d:{_day}", 2 * 86400)
+        return _s <= _DEMO_SESSION_QUOTA and _d <= _DEMO_DAILY_QUOTA
+    except Exception:
+        return True
+
+
+def _guest_usage():
+    """返回 (上传/重建剩余, 提问剩余)；Redis 不可用时返回 (None, None)。"""
+    _r = _quota_redis()
+    if _r is None:
+        return (None, None)
+    _vid = st.session_state.get("_visitor_id") or "anon"
+    try:
+        _u = int(_r.get(f"demoq:gu:{_vid}") or 0)
+        _q = int(_r.get(f"demoq:gq:{_vid}") or 0)
+        return (max(_DEMO_GUEST_UPLOADS - _u, 0), max(_DEMO_GUEST_QUERIES - _q, 0))
+    except Exception:
+        return (None, None)
+
+
+def _guest_consume_upload() -> bool:
+    _r = _quota_redis()
+    if _r is None:
+        return True
+    _vid = st.session_state.get("_visitor_id") or "anon"
+    try:
+        _u = _r.incr(f"demoq:gu:{_vid}")
+        _r.expire(f"demoq:gu:{_vid}", 7 * 86400)
+        return _u <= _DEMO_GUEST_UPLOADS
+    except Exception:
+        return True
+
+
+def _guest_consume_query() -> bool:
+    _r = _quota_redis()
+    if _r is None:
+        return True
+    _vid = st.session_state.get("_visitor_id") or "anon"
+    try:
+        _q = _r.incr(f"demoq:gq:{_vid}")
+        _r.expire(f"demoq:gq:{_vid}", 7 * 86400)
+        return _q <= _DEMO_GUEST_QUERIES
+    except Exception:
+        return True
+
+
 components.html(
     """
     <script>
     (function () {
-      var tries = 0;
+      // 首次进入自动展开一次；之后把控制权交给用户
+      try {
+        if (!sessionStorage.getItem('ad_sb_init')) {
+          sessionStorage.setItem('ad_sb_init', '1');
+          var t0 = 0;
+          var timer0 = setInterval(function () {
+            var sb0 = parent.document.querySelector('section[data-testid="stSidebar"]');
+            var btn0 = parent.document.querySelector('[data-testid="stSidebarCollapseButton"] button');
+            if (!sb0 || !btn0) {
+              if (++t0 > 40) { clearInterval(timer0); }
+              return;
+            }
+            if (sb0.getBoundingClientRect().width < 50) {
+              btn0.click();
+            } else {
+              clearInterval(timer0);
+            }
+          }, 400);
+        }
+      } catch (e) {}
+      // 侧边栏收起时，显示浮动展开按钮
       var timer = setInterval(function () {
         var sb = parent.document.querySelector('section[data-testid="stSidebar"]');
-        var btn = parent.document.querySelector('[data-testid="stSidebarCollapseButton"] button');
-        if (!sb || !btn) {
-          if (++tries > 40) { clearInterval(timer); }
-          return;
+        var fab = parent.document.getElementById('ad-sb-fab');
+        if (!sb) { return; }
+        if (!fab) {
+          fab = parent.document.createElement('button');
+          fab.id = 'ad-sb-fab';
+          fab.title = '展开侧边栏';
+          fab.innerHTML = '&#9776;';
+          fab.style.cssText = 'position:fixed;top:64px;left:8px;z-index:1001;width:36px;height:36px;border-radius:10px;border:1px solid #334155;background:#0f172a;color:#e2e8f0;font-size:16px;line-height:1;cursor:pointer;display:none;box-shadow:0 2px 10px rgba(0,0,0,.4);';
+          fab.addEventListener('click', function () {
+            var ctrl = parent.document.querySelector('[data-testid="stSidebarCollapseButton"] button');
+            if (ctrl) { ctrl.click(); }
+          });
+          parent.document.body.appendChild(fab);
         }
-        if (sb.getBoundingClientRect().width < 50) {
-          btn.click();
-        } else {
-          clearInterval(timer);
-        }
-      }, 400);
+        fab.style.display = (sb.getBoundingClientRect().width < 50) ? 'block' : 'none';
+      }, 500);
     })();
     </script>
     """,
@@ -187,7 +354,6 @@ st.markdown(
       /* —— Streamlit 控件覆写 —— */
       section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0b0f1e,#0a0e1a);
         border-right:1px solid var(--stroke);}
-      section[data-testid="stSidebar"] [data-testid="stSidebarCollapseButton"]{display:none !important;}
       section[data-testid="stSidebar"] .block-container{padding-top:1.4rem;}
       .stTextInput input{background:var(--surface-2)!important; color:var(--ink)!important;
         border:1px solid var(--stroke-2)!important; border-radius:14px!important; height:52px; font-size:.95rem;
@@ -323,8 +489,60 @@ def esc(x) -> str:
     return html.escape(str(x))
 
 
+# ============================ 文档管理（上传清单） ============================
+_UPLOADS_META = os.path.join("data", "uploads_meta.json")
+
+
+def _load_uploads_meta() -> dict:
+    import json
+    try:
+        with open(_UPLOADS_META, "r", encoding="utf-8") as _f:
+            _data = json.load(_f)
+        return _data if isinstance(_data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_uploads_meta(meta: dict) -> None:
+    import json
+    try:
+        os.makedirs(os.path.dirname(_UPLOADS_META), exist_ok=True)
+        with open(_UPLOADS_META, "w", encoding="utf-8") as _f:
+            json.dump(meta, _f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _fmt_size(n: int) -> str:
+    n = float(n)
+    for _unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or _unit == "GB":
+            return f"{int(n)} B" if _unit == "B" else f"{n:.1f} {_unit}"
+        n /= 1024.0
+    return f"{n:.1f} GB"
+
+
 # ============================ 侧边栏 ============================
 with st.sidebar:
+    _is_guest = st.session_state.get("_mode") == "guest"
+    _s_left, _d_left = _quota_usage()
+    if _is_guest:
+        _gu_left, _gq_left = _guest_usage()
+        if _d_left is not None:
+            st.markdown(
+                f"<div class='card' style='margin-bottom:12px'><b style='font-size:.9rem'>访客模式</b>"
+                f"<div style='color:var(--faint);font-size:.76rem;margin-top:6px'>上传/重建剩余 {_gu_left} 次 · 提问剩余 {_gq_left} 次 · 全站今日 {_d_left} 次</div></div>",
+                unsafe_allow_html=True,
+            )
+    elif _d_left is not None:
+        st.markdown(
+            f"<div class='card' style='margin-bottom:12px'><b style='font-size:.9rem'>今日剩余额度</b>"
+            f"<div style='color:var(--faint);font-size:.76rem;margin-top:6px'>全站 {_d_left} 次 · 本会话 {_s_left} 次</div></div>",
+            unsafe_allow_html=True,
+        )
+    if st.button("退出登录", use_container_width=True):
+        st.session_state["_authed"] = False
+        st.rerun()
     st.markdown("<div class='eyebrow'>Console</div>", unsafe_allow_html=True)
     st.markdown("<div style='font-size:1.15rem;font-weight:800;margin:-4px 0 2px'>AgentDesk</div>"
                 "<div style='color:var(--muted);font-size:.8rem'>Agentic RAG · 多智能体</div>",
@@ -383,24 +601,100 @@ with st.sidebar:
     )
     if _up:
         saved = []
-        for _f in _up:
+        _meta = _load_uploads_meta()
+        _files_meta = _meta.setdefault("files", {})
+        _guest_blocked = _is_guest and (_gu_left is not None and _gu_left <= 0)
+        if _guest_blocked:
+            st.error("访客上传额度已用完（最多 3 次）。获取密码可继续使用完整功能。")
+        for _f in (_up if not _guest_blocked else []):
             _name = os.path.basename(_f.name)
             _dest = os.path.join("data", "docs", _name)
+            if _name not in _files_meta and os.path.exists(_dest):
+                st.error(f"系统内置文档不可覆盖：{_name}（请重命名后再上传）")
+                continue
             try:
                 with open(_dest, "wb") as _fh:
                     _fh.write(_f.getbuffer())
+                _files_meta[_name] = {
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "size": os.path.getsize(_dest),
+                }
                 saved.append(_name)
             except Exception as _e:
                 st.error(f"保存 {_name} 失败：{_e}")
+        _save_uploads_meta(_meta)
         if saved:
+            if _is_guest:
+                _guest_consume_upload()
             ensure_index.clear()
             st.session_state["_up_key"] = st.session_state.get("_up_key", 0) + 1
             st.rerun()
     if st.button("重建索引", use_container_width=True, key="rebuild_idx"):
-        ensure_index.clear()
-        _rebuild_index()
+        _guest_blocked2 = _is_guest and (_gu_left is not None and _gu_left <= 0)
+        if _guest_blocked2:
+            st.error("访客上传/重建额度已用完（最多 3 次）。获取密码可继续使用完整功能。")
+        else:
+            if _is_guest:
+                _guest_consume_upload()
+            ensure_index.clear()
+            _rebuild_index()
         st.session_state["_toast"] = "索引重建完成"
         st.rerun()
+
+    st.markdown("<div class='eyebrow' style='margin-top:18px'>知识库 · 文档管理</div>",
+                unsafe_allow_html=True)
+    _meta = _load_uploads_meta()
+    _files_meta = _meta.get("files", {})
+    _doc_rows = []
+    try:
+        for _name in sorted(os.listdir(os.path.join("data", "docs"))):
+            _p = os.path.join("data", "docs", _name)
+            if not os.path.isfile(_p):
+                continue
+            _info = _files_meta.get(_name)
+            _doc_rows.append({
+                "文件名": _name,
+                "大小": _fmt_size(os.path.getsize(_p)),
+                "来源": "网页上传" if _info else "系统内置",
+                "上传时间": _info["time"] if _info else "—",
+            })
+    except Exception:
+        pass
+    if _doc_rows:
+        st.dataframe(_doc_rows, hide_index=True, use_container_width=True, height=220)
+    else:
+        st.caption("知识库为空")
+    _deletable = [r["文件名"] for r in _doc_rows if r["来源"] == "网页上传"]
+    if _deletable:
+        with st.expander("删除网页上传的文档", expanded=False):
+            _del_name = st.selectbox("选择要删除的文档", _deletable, key="del_doc")
+            _del_key = f"del_pw_{st.session_state.get('_del_key', 0)}"
+            _del_pw = st.text_input("删除密码（管理员）", type="password", key=_del_key,
+                                    placeholder="输入密码后可删除")
+            if st.button("确认删除", use_container_width=True, key="del_btn"):
+                _expected = os.environ.get("DELETE_PASSWORD") or _DEMO_PASSWORD_HASH
+                if not _expected:
+                    st.error("未配置删除密码（DELETE_PASSWORD），请联系管理员。")
+                elif hashlib.sha256(_del_pw.encode("utf-8")).hexdigest() != _expected:
+                    st.error("删除密码错误，请重试。")
+                else:
+                    try:
+                        os.remove(os.path.join("data", "docs", _del_name))
+                        _files_meta.pop(_del_name, None)
+                        _save_uploads_meta(_meta)
+                        ensure_index.clear()
+                        try:
+                            _rebuild_index()
+                        except Exception as _e:
+                            st.warning(f"文件已删除，但索引重建失败（{_e}）；embedding 可用后会自动重建。")
+                        st.success(f"已删除：{_del_name}")
+                        st.session_state["_toast"] = f"已删除 {_del_name}"
+                        st.session_state["_del_key"] = st.session_state.get("_del_key", 0) + 1
+                        st.rerun()
+                    except Exception as _e:
+                        st.error(f"删除失败：{_e}")
+    else:
+        st.caption("暂无网页上传的文档；系统内置文档不可删除")
 
     st.markdown("<div class='eyebrow' style='margin-top:18px'>试一试</div>", unsafe_allow_html=True)
     for q in SAMPLES:
@@ -515,6 +809,20 @@ _autorun = st.session_state.pop("_autorun", False)
 # ============================ 运行与渲染 ============================
 _last = None
 if (go or _autorun) and query.strip():
+    _is_guest = st.session_state.get("_mode") == "guest"
+    _s_left, _d_left = _quota_usage()
+    if _is_guest:
+        _gu_left, _gq_left = _guest_usage()
+        if _gq_left is not None and _gq_left <= 0:
+            st.warning(f"访客提问额度已用完（最多 {_DEMO_GUEST_QUERIES} 次）。获取密码可继续使用。")
+            st.stop()
+        _s_left = None if _s_left is None else 999
+    if (_s_left is not None and _s_left <= 0) or (_d_left is not None and _d_left <= 0):
+        st.warning(
+            f"演示额度已用完（本会话剩余 {_s_left} 次，今日全站剩余 {_d_left} 次）。"
+            "如需更多额度，请联系作者。"
+        )
+        st.stop()
     try:
         with st.spinner("Agent 编排执行中：记忆召回 → 改写 → 检索 → 工具 → 生成 → 反思 → 记忆写入…"):
             state = run_query(
@@ -522,6 +830,9 @@ if (go or _autorun) and query.strip():
                 user_id=(st.session_state.get("mem_uid") or "alice").strip(),
                 session_id=st.session_state.get("mem_sid"),
             )
+        if _is_guest:
+            _guest_consume_query()
+        _quota_consume()
     except Exception as _e:
         st.error(f"运行出错（多为模型接口超时/报错）：{type(_e).__name__}: {_e}　"
                  "可在上方换一个更稳的模型重试。")
