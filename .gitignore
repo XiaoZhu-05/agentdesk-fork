@@ -14,3 +14,6 @@ eval/reports/traces.jsonl
 Snipaste_*.png
 localhost_*.png
 test_uploads/
+
+# 评测中间产物（由 run_compare.py 重新生成）
+eval/openwebui_对比/store_*.json

@@ -1,0 +1,13 @@
+{
+  "doc_hit1": 0.6389,
+  "doc_hit3": 0.8889,
+  "doc_hit5": 0.9444,
+  "mrr5": 0.7671,
+  "chunk_hit1": 0.3889,
+  "chunk_hit3": 0.6389,
+  "chunk_hit5": 0.75,
+  "answer_cross": 4,
+  "n_valid": 36,
+  "n_questions": 40,
+  "n_common_valid": 36
+}

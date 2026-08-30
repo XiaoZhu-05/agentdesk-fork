@@ -30,7 +30,7 @@ class VectorStore:
         if self._matrix is None and self._chunks:
             self._matrix = np.array([c.embedding for c in self._chunks], dtype=np.float32)
 
-    def search(self, query_vec: List[float], top_k: int = 5):
+    def search(self, query_vec: List[float], top_k: int = 5, doc_ids=None):
         self._ensure_matrix()
         if not self._chunks or self._matrix is None:
             return []
@@ -39,8 +39,14 @@ class VectorStore:
         mn = np.linalg.norm(self._matrix, axis=1)
         mn[mn == 0] = 1.0
         scores = (self._matrix @ q) / (mn * qn)
-        idx = np.argsort(-scores)[:top_k]
-        return [(self._chunks[i], float(scores[i])) for i in idx]
+        out = []
+        for i in np.argsort(-scores):
+            if doc_ids is not None and self._chunks[i].doc_id not in doc_ids:
+                continue
+            out.append((self._chunks[i], float(scores[i])))
+            if len(out) >= top_k:
+                break
+        return out
 
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)

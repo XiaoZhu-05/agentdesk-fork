@@ -110,14 +110,14 @@ class QdrantMemoryStore:
 
     def search(self, user_id: str, vec: List[float], top_k: int = 3) -> List[Tuple[MemoryRecord, float]]:
         try:
-            hits = self.client.search(
-                collection_name=self.collection, query_vector=vec,
+            res = self.client.query_points(
+                collection_name=self.collection, query=vec,
                 query_filter=self._user_filter(user_id), limit=top_k,
             )
         except Exception:
             return []  # collection 尚未创建（冷启动）等情况：视为无记忆
         out: List[Tuple[MemoryRecord, float]] = []
-        for h in hits:
+        for h in res.points:
             p = h.payload or {}
             if p.get("superseded_by"):
                 continue

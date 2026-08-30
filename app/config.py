@@ -17,6 +17,7 @@ def _load_env_file(path: str = ".env") -> None:
 
 
 try:
+    from pydantic import Field
     from pydantic_settings import BaseSettings, SettingsConfigDict
 
     class Settings(BaseSettings):
@@ -26,8 +27,11 @@ try:
         chat_model: str = "gpt-4o-mini"
         embedding_model: str = "text-embedding-3-small"
         top_k: int = 5
+        compare_top_k: int = 12
+        max_expand_top_k: int = 20
         chunk_size: int = 512
         chunk_overlap: int = 64
+        text_splitter: str = Field(default="structure", validation_alias="RAG_TEXT_SPLITTER")
         max_iterations: int = 3
         use_mcp: bool = False
         vector_backend: str = "memory"
@@ -60,8 +64,11 @@ except ImportError:
         chat_model = os.environ.get("CHAT_MODEL", "gpt-4o-mini")
         embedding_model = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
         top_k = int(os.environ.get("TOP_K", "5"))
+        compare_top_k = int(os.environ.get("COMPARE_TOP_K", "12"))
+        max_expand_top_k = int(os.environ.get("MAX_EXPAND_TOP_K", "20"))
         chunk_size = int(os.environ.get("CHUNK_SIZE", "512"))
         chunk_overlap = int(os.environ.get("CHUNK_OVERLAP", "64"))
+        text_splitter = os.environ.get("RAG_TEXT_SPLITTER", "structure")
         max_iterations = int(os.environ.get("MAX_ITERATIONS", "3"))
         use_mcp = os.environ.get("USE_MCP", "").strip() in ("1", "true", "True")
         vector_backend = os.environ.get("VECTOR_BACKEND", "memory")

@@ -16,3 +16,5 @@ xlrd>=2.0.1
 # 可选：真实向量库与缓存（不装则自动回退内存）
 qdrant-client>=1.9
 redis>=5.0
+# 可选：cross-encoder 重排（不装则自动回退离线打分；需设置环境变量 RERANK_MODEL）
+sentence-transformers>=6.0

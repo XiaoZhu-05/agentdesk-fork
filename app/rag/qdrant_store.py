@@ -42,12 +42,20 @@ class QdrantStore:
         ]
         self.client.upsert(collection_name=self.collection, points=points)
 
-    def search(self, query_vec: List[float], top_k: int = 5):
-        hits = self.client.search(
-            collection_name=self.collection, query_vector=query_vec, limit=top_k
+    def search(self, query_vec: List[float], top_k: int = 5, doc_ids=None):
+        from qdrant_client.models import FieldCondition, Filter, MatchAny
+
+        query_filter = None
+        if doc_ids:
+            query_filter = Filter(
+                must=[FieldCondition(key="doc_id", match=MatchAny(any=list(doc_ids)))]
+            )
+        res = self.client.query_points(
+            collection_name=self.collection, query=query_vec,
+            query_filter=query_filter, limit=top_k,
         )
         out = []
-        for h in hits:
+        for h in res.points:
             p = h.payload or {}
             out.append((Chunk(p["doc_id"], p["chunk_id"], p["text"], []), float(h.score)))
         return out

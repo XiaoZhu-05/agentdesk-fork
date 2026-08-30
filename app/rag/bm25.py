@@ -32,9 +32,12 @@ class BM25:
             term: math.log(1 + (n - f + 0.5) / (f + 0.5)) for term, f in df.items()
         }
 
-    def search(self, query: str, top_k: int = 20) -> List[tuple[Chunk, float]]:
+    def search(self, query: str, top_k: int = 20, doc_ids=None) -> List[tuple[Chunk, float]]:
         if not self.docs:
             return []
+        allowed = None
+        if doc_ids is not None:
+            allowed = {i for i, c in enumerate(self.chunks) if c.doc_id in doc_ids}
         q_terms = tokenize(query)
         scores: List[float] = []
         for i, freq in enumerate(self.freqs):
@@ -49,4 +52,12 @@ class BM25:
                 s += idf * (tf * (self.k1 + 1)) / denom
             scores.append(s)
         ranked = sorted(range(len(scores)), key=lambda i: -scores[i])[:top_k]
-        return [(self.chunks[i], scores[i]) for i in ranked if scores[i] > 0]
+        out = []
+        for i in ranked:
+            if allowed is not None and i not in allowed:
+                continue
+            if scores[i] > 0:
+                out.append((self.chunks[i], scores[i]))
+            if len(out) >= top_k:
+                break
+        return out

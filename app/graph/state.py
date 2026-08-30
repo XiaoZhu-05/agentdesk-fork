@@ -10,6 +10,9 @@ class AgentState(TypedDict, total=False):
     query: str
     plan: str
     queries: List[str]
+    filter_doc_ids: List[str]
+    top_k: int
+    weights: dict
     evidence: List[Evidence]
     tool_results: List[dict]
     answer: str

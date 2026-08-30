@@ -38,8 +38,8 @@ def _calculator(args: dict) -> str:
 def _kb_stats(args: dict) -> str:
     # 演示一个“查库”类工具；真实场景可换成 SQL 查询
     from app.rag.indexer import INDEX_PATH
-    from app.rag.store import VectorStore
-    store = VectorStore()
+    from app.rag.store_factory import get_store
+    store = get_store()
     store.load(INDEX_PATH)
     docs = sorted({c.doc_id for c in store.chunks})
     return (f"文档总数={len(docs)}（权威值：回答文档数量时直接采用此数，请勿自行数列表）"
