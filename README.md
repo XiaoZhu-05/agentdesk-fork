@@ -180,8 +180,7 @@ agentdesk/
 ├── data/                    # docs 示例文档 + index 索引 + uploads_meta.json
 ├── streamlit_app.py         # 可视化控制台（上传/管理/问答/记忆/配额）
 ├── check_api.py             # 快速自检真实模型链路
-├── docker-compose.yml · Dockerfile · requirements.txt
-└── push_to_github.bat
+└── docker-compose.yml · Dockerfile · requirements.txt
 ```
 
 ---
